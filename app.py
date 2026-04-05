@@ -277,11 +277,16 @@ if page.startswith("📂"):
     )
 
     if uploaded is not None:
-        with st.spinner("Loading data …"):
-            df = load_data(uploaded)
-        st.session_state["df"] = df
-        st.session_state["file_name"] = uploaded.name
-        st.success(f"✅  **{uploaded.name}** loaded — {df.shape[0]:,} rows × {df.shape[1]} columns")
+        file_id = getattr(uploaded, "file_id", str(uploaded.size) + uploaded.name)
+        if st.session_state.get("last_file_id") != file_id:
+            with st.spinner("Loading data …"):
+                df = load_data(uploaded)
+            st.session_state["df"] = df
+            st.session_state["file_name"] = uploaded.name
+            st.session_state["last_file_id"] = file_id
+        
+        df_current = st.session_state.get("df", pd.DataFrame())
+        st.success(f"✅  **{uploaded.name}** active — {df_current.shape[0]:,} rows × {df_current.shape[1]} columns")
     
     if "df" in st.session_state and st.session_state["df"] is not None:
         if "msg_success" in st.session_state:
