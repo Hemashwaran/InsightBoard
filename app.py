@@ -284,6 +284,10 @@ if page.startswith("📂"):
         st.success(f"✅  **{uploaded.name}** loaded — {df.shape[0]:,} rows × {df.shape[1]} columns")
     
     if "df" in st.session_state and st.session_state["df"] is not None:
+        if "msg_success" in st.session_state:
+            st.success(st.session_state["msg_success"])
+            del st.session_state["msg_success"]
+
         df = st.session_state["df"]
 
         # ── Metrics Row ──
@@ -321,21 +325,24 @@ if page.startswith("📂"):
                             if not mode_val.empty:
                                 df[col] = df[col].fillna(mode_val.iloc[0])
                 st.session_state["df"] = df
-                st.success("Missing values filled!")
+                st.session_state["msg_success"] = "Missing values filled!"
+                st.rerun()
 
         with c2:
             if st.button("Drop Duplicate Rows", use_container_width=True):
                 before = len(df)
                 df = df.drop_duplicates()
                 st.session_state["df"] = df
-                st.success(f"Removed {before - len(df):,} duplicates.")
+                st.session_state["msg_success"] = f"Removed {before - len(df):,} duplicates."
+                st.rerun()
 
         with c3:
             if st.button("Drop Rows with Missing", use_container_width=True):
                 before = len(df)
                 df = df.dropna()
                 st.session_state["df"] = df
-                st.success(f"Dropped {before - len(df):,} rows.")
+                st.session_state["msg_success"] = f"Dropped {before - len(df):,} rows."
+                st.rerun()
     else:
         st.info("👆 Upload a dataset to get started.")
 
