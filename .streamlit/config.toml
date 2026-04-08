@@ -7,3 +7,11 @@ font = "sans serif"
 
 [server]
 maxUploadSize = 200
+headless = true
+enableWebsocketCompression = true
+enableCORS = false
+
+[runner]
+# Prevent the worker from running out of memory by disabling
+# magic command scanning on large scripts.
+magicEnabled = false
