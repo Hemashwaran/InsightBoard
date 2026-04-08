@@ -199,37 +199,53 @@ def infer_task(series: pd.Series) -> str:
     return "regression"
 
 
+# Maximum unique values per categorical column before it is dropped instead
+# of one-hot encoded. Encoding a column with 500+ unique values would create
+# hundreds of extra columns and easily OOM a cloud container.
+_MAX_CAT_CARDINALITY = 50
+
+
 def preprocess_features(X: pd.DataFrame) -> pd.DataFrame:
-    """One-hot encode categoricals, fill missing, return numeric matrix."""
+    """One-hot encode low-cardinality categoricals, fill missing values, return numeric matrix."""
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
-    if cat_cols:
-        X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+    # Drop high-cardinality text columns — they'd explode memory with get_dummies
+    safe_cat_cols = [c for c in cat_cols if X[c].nunique() <= _MAX_CAT_CARDINALITY]
+    dropped_cols = [c for c in cat_cols if c not in safe_cat_cols]
+    if dropped_cols:
+        X = X.drop(columns=dropped_cols)
+    if safe_cat_cols:
+        X = pd.get_dummies(X, columns=safe_cat_cols, drop_first=True)
     for col in X.columns:
         if X[col].isnull().any():
             X[col] = X[col].fillna(X[col].median()) if pd.api.types.is_numeric_dtype(X[col]) else X[col].fillna(X[col].mode().iloc[0])
     return X
 
 
+# ── Row threshold below which SVMs are allowed ──────────────────────────────
+SVM_MAX_ROWS = 5_000
+
+# n_estimators is kept low (50) intentionally so that cloud deployments
+# (≈800 MB RAM) don't OOM on 10 MB+ datasets.
 CLASSIFICATION_MODELS = {
-    "Random Forest": lambda: RandomForestClassifier(n_estimators=100, random_state=42),
-    "Gradient Boosting": lambda: GradientBoostingClassifier(n_estimators=100, random_state=42),
+    "Random Forest": lambda: RandomForestClassifier(n_estimators=50, n_jobs=-1, random_state=42),
+    "Gradient Boosting": lambda: GradientBoostingClassifier(n_estimators=50, random_state=42),
     "Logistic Regression": lambda: LogisticRegression(max_iter=1000, random_state=42),
     "Support Vector Machine": lambda: SVC(probability=True, random_state=42),
 }
 
 REGRESSION_MODELS = {
-    "Random Forest": lambda: RandomForestRegressor(n_estimators=100, random_state=42),
-    "Gradient Boosting": lambda: GradientBoostingRegressor(n_estimators=100, random_state=42),
+    "Random Forest": lambda: RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=42),
+    "Gradient Boosting": lambda: GradientBoostingRegressor(n_estimators=50, random_state=42),
     "Linear Regression": lambda: LinearRegression(),
     "Support Vector Machine": lambda: SVR(),
 }
 
 if XGBOOST_AVAILABLE:
     CLASSIFICATION_MODELS["XGBoost"] = lambda: XGBClassifier(
-        n_estimators=100, use_label_encoder=False, eval_metric="logloss", random_state=42
+        n_estimators=50, eval_metric="logloss", random_state=42, tree_method="hist"
     )
     REGRESSION_MODELS["XGBoost"] = lambda: XGBRegressor(
-        n_estimators=100, random_state=42
+        n_estimators=50, random_state=42, tree_method="hist"
     )
 
 
@@ -273,7 +289,7 @@ if page.startswith("📂"):
     uploaded = st.file_uploader(
         "Drag & drop a CSV or Excel file",
         type=["csv", "xlsx", "xls"],
-        help="Max 200 MB",
+        help="Max 200 MB — large files (>5 MB) may be sampled for visualizations",
     )
 
     if uploaded is not None:
@@ -286,7 +302,15 @@ if page.startswith("📂"):
             st.session_state["last_file_id"] = file_id
         
         df_current = st.session_state.get("df", pd.DataFrame())
-        st.success(f"✅  **{uploaded.name}** active — {df_current.shape[0]:,} rows × {df_current.shape[1]} columns")
+        mem_mb = df_current.memory_usage(deep=True).sum() / 1024**2
+        st.success(f"✅  **{uploaded.name}** active — {df_current.shape[0]:,} rows × {df_current.shape[1]} columns  •  ~{mem_mb:.1f} MB in memory")
+        if mem_mb > 150:
+            st.warning(
+                "⚠️ **Large dataset detected.** This app is deployed on Streamlit Community Cloud "
+                "which has limited RAM (~1 GB). Training ensemble models with 100+ trees on this data "
+                "may cause the app to crash. Tips: use **XGBoost** or **Logistic / Linear Regression**, "
+                "and enable **Remove Low Variance Features**."
+            )
     
     if "df" in st.session_state and st.session_state["df"] is not None:
         if "msg_success" in st.session_state:
@@ -374,6 +398,7 @@ elif page.startswith("🔍"):
     # ── Tab 1: Descriptive Stats ──
     with tab1:
         st.subheader("Descriptive Statistics")
+        # describe() on a huge dataset is fine — it's fast and row-count agnostic
         st.dataframe(df.describe(include="all").T, use_container_width=True)
 
         st.subheader("Quick Insights")
@@ -420,7 +445,14 @@ elif page.startswith("🔍"):
         if numeric_df.shape[1] < 2:
             st.info("Need at least 2 numeric columns for correlation analysis.")
         else:
-            corr = numeric_df.corr()
+            # Cap at 30 columns to keep the heatmap readable and fast
+            _MAX_CORR_COLS = 30
+            if numeric_df.shape[1] > _MAX_CORR_COLS:
+                st.caption(f"ℹ️ Showing first {_MAX_CORR_COLS} numeric columns (dataset has {numeric_df.shape[1]}).")
+                numeric_df = numeric_df.iloc[:, :_MAX_CORR_COLS]
+            # Sample rows for correlation to avoid OOM on huge datasets
+            sample_df = numeric_df.sample(min(10_000, len(numeric_df)), random_state=42)
+            corr = sample_df.corr()
             fig = px.imshow(
                 corr,
                 text_auto=".2f",
@@ -454,6 +486,12 @@ elif page.startswith("🔍"):
         numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
         cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
+        # Sample for chart rendering to avoid memory spikes on large data
+        _VIZ_SAMPLE = 20_000
+        viz_df = df.sample(min(_VIZ_SAMPLE, len(df)), random_state=42) if len(df) > _VIZ_SAMPLE else df
+        if len(df) > _VIZ_SAMPLE:
+            st.caption(f"ℹ️ Charts are rendered on a {_VIZ_SAMPLE:,}-row sample for performance.")
+
         if numeric_cols:
             st.subheader("Numeric Feature Distributions")
             sel_num = st.multiselect("Select numeric columns", numeric_cols, default=numeric_cols[:4])
@@ -464,7 +502,7 @@ elif page.startswith("🔍"):
                 for i, col in enumerate(sel_num):
                     r, c = divmod(i, n_cols)
                     fig.add_trace(
-                        go.Histogram(x=df[col], name=col, marker_color="#6C63FF", opacity=0.8),
+                        go.Histogram(x=viz_df[col], name=col, marker_color="#6C63FF", opacity=0.8),
                         row=r + 1, col=c + 1,
                     )
                 fig.update_layout(
@@ -624,8 +662,26 @@ elif page.startswith("⚙️"):
 
     st.markdown('<div class="gradient-divider"></div>', unsafe_allow_html=True)
 
+    # ── SVM row warning ──────────────────────────────────────────────────────
+    if "Support Vector Machine" in model_name:
+        n_rows = len(df)
+        if n_rows > SVM_MAX_ROWS:
+            st.warning(
+                f"⚠️ **SVM is not recommended for {n_rows:,} rows.** "
+                f"Training time grows quadratically with data size and will likely crash on Streamlit Cloud. "
+                f"Please choose Random Forest, Gradient Boosting, or XGBoost instead."
+            )
+
     # ── Train Button ──
     if st.button("🚀 Train Model", use_container_width=True):
+        # Hard-block SVM on large datasets before even starting
+        if "Support Vector Machine" in model_name and len(df) > SVM_MAX_ROWS:
+            st.error(
+                f"🚫 SVM training blocked: dataset has {len(df):,} rows (limit: {SVM_MAX_ROWS:,}). "
+                "Choose a different algorithm."
+            )
+            st.stop()
+
         with st.spinner("Preprocessing & training … please wait"):
             try:
                 # ── Prepare ──
