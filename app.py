@@ -206,7 +206,18 @@ _MAX_CAT_CARDINALITY = 50
 
 
 def preprocess_features(X: pd.DataFrame) -> pd.DataFrame:
-    """One-hot encode low-cardinality categoricals, fill missing values, return numeric matrix."""
+    """One-hot encode low-cardinality categoricals, convert datetimes to numeric,
+    fill missing values, and return a fully numeric matrix safe for sklearn."""
+
+    X = X.copy()
+
+    # ── 1. Convert datetime columns → integer Unix timestamps (seconds) ──────
+    # sklearn / numpy cannot mix datetime64 with float64, so we cast first.
+    datetime_cols = X.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
+    for col in datetime_cols:
+        X[col] = X[col].astype("int64") // 10**9  # nanoseconds → seconds
+
+    # ── 2. One-hot encode low-cardinality categorical columns ─────────────────
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
     # Drop high-cardinality text columns — they'd explode memory with get_dummies
     safe_cat_cols = [c for c in cat_cols if X[c].nunique() <= _MAX_CAT_CARDINALITY]
@@ -215,9 +226,17 @@ def preprocess_features(X: pd.DataFrame) -> pd.DataFrame:
         X = X.drop(columns=dropped_cols)
     if safe_cat_cols:
         X = pd.get_dummies(X, columns=safe_cat_cols, drop_first=True)
+
+    # ── 3. Drop any residual non-numeric columns (timedelta, complex, etc.) ───
+    non_numeric = X.select_dtypes(exclude="number").columns.tolist()
+    if non_numeric:
+        X = X.drop(columns=non_numeric)
+
+    # ── 4. Fill remaining missing values ─────────────────────────────────────
     for col in X.columns:
         if X[col].isnull().any():
-            X[col] = X[col].fillna(X[col].median()) if pd.api.types.is_numeric_dtype(X[col]) else X[col].fillna(X[col].mode().iloc[0])
+            X[col] = X[col].fillna(X[col].median())
+
     return X
 
 
