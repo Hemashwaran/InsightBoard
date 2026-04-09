@@ -319,10 +319,19 @@ if page.startswith("📂"):
             st.session_state["df"] = df
             st.session_state["file_name"] = uploaded.name
             st.session_state["last_file_id"] = file_id
-        
+
         df_current = st.session_state.get("df", pd.DataFrame())
         mem_mb = df_current.memory_usage(deep=True).sum() / 1024**2
-        st.success(f"✅  **{uploaded.name}** active — {df_current.shape[0]:,} rows × {df_current.shape[1]} columns  •  ~{mem_mb:.1f} MB in memory")
+
+        banner_col, clear_col = st.columns([5, 1])
+        banner_col.success(f"✅  **{uploaded.name}** active — {df_current.shape[0]:,} rows × {df_current.shape[1]} columns  •  ~{mem_mb:.1f} MB in memory")
+        if clear_col.button("🗑️ Clear", use_container_width=True, help="Remove current dataset and upload a new one"):
+            for _key in ["df", "file_name", "last_file_id", "trained_model",
+                         "model_features", "task", "le_target", "scaler",
+                         "predictions_df", "msg_success"]:
+                st.session_state.pop(_key, None)
+            st.rerun()
+
         if mem_mb > 150:
             st.warning(
                 "⚠️ **Large dataset detected.** This app is deployed on Streamlit Community Cloud "
@@ -889,10 +898,41 @@ elif page.startswith("🎯"):
             pred_df = load_data(new_file)
             st.dataframe(pred_df.head(10), use_container_width=True)
 
+    # ── Row limit to prevent OOM during prediction ────────────────────────────
+    _PRED_HARD_LIMIT = 100_000   # rows above this are always sampled
+    _PRED_DEFAULT    =  50_000   # default slider value
+
+    if pred_df is not None:
+        n_rows_pred = len(pred_df)
+        if n_rows_pred > _PRED_HARD_LIMIT:
+            st.warning(
+                f"⚠️ Dataset has **{n_rows_pred:,} rows**. Predicting on all rows may crash the app. "
+                f"Use the slider below to limit rows."
+            )
+        if n_rows_pred > 1_000:
+            max_rows_slider = st.slider(
+                "Max rows to predict on",
+                min_value=1_000,
+                max_value=min(n_rows_pred, _PRED_HARD_LIMIT),
+                value=min(n_rows_pred, _PRED_DEFAULT),
+                step=1_000,
+                help="Lower = faster & less memory. Full CSV download will contain only predicted rows.",
+            )
+        else:
+            max_rows_slider = n_rows_pred
+
     if pred_df is not None and st.button("🎯 Generate Predictions", use_container_width=True):
         with st.spinner("Running predictions …"):
             try:
-                X_pred = preprocess_features(pred_df.copy())
+                # ── Apply row limit ───────────────────────────────────────────
+                if len(pred_df) > max_rows_slider:
+                    st.caption(f"ℹ️ Predicting on first **{max_rows_slider:,}** rows (sampled for memory safety).")
+                    pred_df_limited = pred_df.iloc[:max_rows_slider].copy()
+                else:
+                    pred_df_limited = pred_df.copy()
+
+                X_pred = preprocess_features(pred_df_limited)
+
                 # Align columns to training features
                 for col in features:
                     if col not in X_pred.columns:
@@ -902,23 +942,45 @@ elif page.startswith("🎯"):
                 if scaler is not None:
                     X_pred = pd.DataFrame(scaler.transform(X_pred), columns=X_pred.columns)
 
-                predictions = model.predict(X_pred)
+                # ── Chunked batch prediction to avoid memory spikes ───────────
+                _BATCH_SIZE = 10_000
+                if len(X_pred) > _BATCH_SIZE:
+                    chunks = []
+                    progress_bar = st.progress(0, text="Predicting in batches…")
+                    total_batches = (len(X_pred) + _BATCH_SIZE - 1) // _BATCH_SIZE
+                    for i in range(total_batches):
+                        batch = X_pred.iloc[i * _BATCH_SIZE : (i + 1) * _BATCH_SIZE]
+                        chunks.append(model.predict(batch))
+                        progress_bar.progress(
+                            (i + 1) / total_batches,
+                            text=f"Batch {i + 1}/{total_batches} done…",
+                        )
+                    predictions = np.concatenate(chunks)
+                    progress_bar.empty()
+                else:
+                    predictions = model.predict(X_pred)
 
                 if le_target is not None:
                     predictions = le_target.inverse_transform(predictions)
 
-                output_df = pred_df.copy()
+                output_df = pred_df_limited.copy()
                 output_df["Prediction"] = predictions
 
                 st.session_state["predictions_df"] = output_df
 
                 st.success(f"✅ Predictions generated for **{len(output_df):,}** rows!")
-                st.dataframe(output_df, use_container_width=True)
 
-                # Distribution of predictions
+                # ── Show only first 500 rows to avoid UI OOM ─────────────────
+                _DISPLAY_LIMIT = 500
+                st.caption(f"Showing first {min(_DISPLAY_LIMIT, len(output_df)):,} of {len(output_df):,} rows — download CSV below for all results.")
+                st.dataframe(output_df.head(_DISPLAY_LIMIT), use_container_width=True)
+
+                # Distribution of predictions (sampled for chart speed)
                 st.markdown("### 📊 Prediction Distribution")
+                _CHART_SAMPLE = 20_000
+                chart_df = output_df.sample(min(_CHART_SAMPLE, len(output_df)), random_state=42)
                 if task == "classification":
-                    vc = output_df["Prediction"].value_counts()
+                    vc = chart_df["Prediction"].value_counts()
                     fig = px.pie(
                         names=vc.index.astype(str), values=vc.values,
                         title="Predicted Class Distribution",
@@ -927,7 +989,7 @@ elif page.startswith("🎯"):
                     )
                 else:
                     fig = px.histogram(
-                        output_df, x="Prediction",
+                        chart_df, x="Prediction",
                         title="Predicted Value Distribution",
                         template="plotly_dark",
                         color_discrete_sequence=["#6C63FF"],
@@ -941,6 +1003,11 @@ elif page.startswith("🎯"):
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+            except MemoryError:
+                st.error(
+                    "💥 **Out of memory!** The prediction set is too large for this deployment. "
+                    "Please reduce the number of rows using the slider above and try again."
+                )
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
                 st.exception(e)
