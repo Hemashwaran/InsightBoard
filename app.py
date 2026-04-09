@@ -845,20 +845,30 @@ elif page.startswith("⚙️"):
                     st.plotly_chart(fig_imp, use_container_width=True)
 
                 st.success(f"✅ **{model_name}** trained on **{len(X_train):,}** samples — ready for predictions!")
-                
-                # Model Download logic
-                model_pkl = pickle.dumps(model)
-                st.download_button(
-                    label="💾 Download Trained Model (.pkl)",
-                    data=model_pkl,
-                    file_name=f"{model_name.replace(' ', '_').lower()}_model.pkl",
-                    mime="application/octet-stream",
-                    use_container_width=True
-                )
+
+                # Serialize once at train time and cache in session_state.
+                # Calling pickle.dumps() on every Streamlit rerender would
+                # re-serialize a potentially large model each time, spiking
+                # memory and crashing the container.
+                st.session_state["model_pkl"] = pickle.dumps(model)
+                st.session_state["model_name"] = model_name
 
             except Exception as e:
                 st.error(f"Training failed: {e}")
                 st.exception(e)
+
+    # ── Download button is rendered OUTSIDE the train-button block so it
+    # persists across reruns without re-pickling the model each time. ──────────
+    if "model_pkl" in st.session_state:
+        st.markdown("---")
+        _dl_name = st.session_state.get("model_name", "model").replace(" ", "_").lower()
+        st.download_button(
+            label="💾 Download Trained Model (.pkl)",
+            data=st.session_state["model_pkl"],
+            file_name=f"{_dl_name}_model.pkl",
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════
